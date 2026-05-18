@@ -1,5 +1,7 @@
 import threading
 import queue
+import sys
+import os
 from datetime import datetime
 from tkinter import filedialog, messagebox
 
@@ -45,6 +47,21 @@ BORDER_COLOR = "#d4d4d8"
 # ============================================
 
 app = ctk.CTk()
+
+if getattr(sys, "frozen", False):
+
+    base_path = sys._MEIPASS
+
+else:
+
+    base_path = os.path.dirname(__file__)
+
+icon_path = os.path.join(
+    base_path,
+    "azbilling-new-logo.ico"
+)
+
+app.iconbitmap(icon_path)
 
 app.title("AZ Billing Automation")
 
@@ -107,9 +124,22 @@ toolbar.grid_columnconfigure(1, weight=1)
 # ============================================
 # LOGO
 # ============================================
+if getattr(sys, "frozen", False):
+
+    base_path = sys._MEIPASS
+
+else:
+
+    base_path = os.path.dirname(__file__)
+
+logo_path = os.path.join(
+    base_path,
+    "azbilling-new-logo.ico"
+)
+
 
 logo_image = ctk.CTkImage(
-    light_image=Image.open("azbilling-new-logo.png"), size=(85, 85)
+    light_image=Image.open(logo_path), size=(85, 85)
 )
 
 logo_label = ctk.CTkLabel(toolbar, image=logo_image, text="")
