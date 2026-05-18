@@ -1,4 +1,5 @@
 import csv
+from multiprocessing import context
 import subprocess
 import time
 import requests
@@ -13,6 +14,10 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 CDP_URL = "http://127.0.0.1:9222"
+
+PROMISE_URL = (
+    "https://promise.dhs.pa.gov/" "portal/provider/Home/tabid/135/Default.aspx"
+)
 
 PAYER_MAPPING = {
     "UPMC": ["UPMC LTSS (CKH)", "CH2F-UPMC COMMUNITY HEALTHCHOICES"],
@@ -44,7 +49,7 @@ def is_cdp_running():
 
 
 def launch_edge_with_cdp():
-    print("🚀 Launching new Edge browser with CDP...")
+    print("🚀 Launching Edge with CDP...")
     edge_cmd = [
         "cmd",
         "/c",
@@ -57,64 +62,51 @@ def launch_edge_with_cdp():
     subprocess.Popen(edge_cmd)
     for _ in range(20):
         if is_cdp_running():
-            print("✅ CDP browser is ready")
+            print("✅ Edge launched and CDP is running")
             return True
         time.sleep(1)
     return False
 
 
-def ensure_edge_cdp():
-    if is_cdp_running():
-        print("✅ Existing CDP browser detected")
-        return
-    print("⚠ No CDP browser detected")
-    success = launch_edge_with_cdp()
-    if not success:
-        raise Exception("❌ Failed to launch Edge with CDP")
+def get_or_create_promise_page(context):
 
+    # ----------------------------------------
+    # CHECK EXISTING TABS
+    # ----------------------------------------
 
-def get_or_create_page(context):
-    if context.pages:
-        page = context.pages[0]
-        print(f"🌐 Attached to existing tab: {page.url}")
-        return page
+    for page in context.pages:
+
+        try:
+
+            current_url = page.url.lower()
+
+            if "promise.dhs.pa.gov" in current_url:
+
+                print(f"🌐 Reusing existing Promise tab: " f"{page.url}")
+
+                page.bring_to_front()
+
+                return page
+
+        except Exception:
+            continue
+
+    # ----------------------------------------
+    # CREATE NEW TAB
+    # ----------------------------------------
+
     page = context.new_page()
-    print("🆕 Created new tab")
+
+    print("🆕 Opening Promise portal...")
+
+    page.goto(PROMISE_URL, wait_until="domcontentloaded", timeout=60000)
+
     return page
 
 
-def get_valid_csv_path() -> Path:
-    """
-    Prompts the user to enter the input CSV file path.
-    Verifies the file exists. Returns Path object if valid, else None.
-    Retries until a valid path is provided or user cancels with empty input.
-    """
-    while True:
-        try:
-            csv_input_path = (
-                input(
-                    "Please enter the path to the input CSV file (or press Enter to cancel): "
-                )
-                .strip('"')
-                .strip()
-            )
-            if csv_input_path == "":
-                print("Input cancelled by user.")
-                return None
-
-            input_path = Path(csv_input_path)
-            if not input_path.is_file():
-                print(
-                    f"❌ Input CSV file not found: {csv_input_path}. Please try again."
-                )
-                continue
-
-            return input_path
-        except Exception as e:
-            print(f"❌ Error processing input: {e}. Please try again.")
-
-
-def prepare_output_folder(input_csv_path: str, timestamp: str) -> Tuple[Path, Path]:
+def prepare_output_folder(
+    input_csv_path: str, timestamp: str, output_base_folder: str
+) -> Tuple[Path, Path]:
     """
     Create an output folder based on the input CSV filename plus current timestamp.
 
@@ -125,23 +117,45 @@ def prepare_output_folder(input_csv_path: str, timestamp: str) -> Tuple[Path, Pa
     input_path = Path(input_csv_path)
     input_stem = input_path.stem
     output_folder_name = f"{input_stem}_{timestamp}"
-    output_folder = Path.cwd() / output_folder_name
+    output_folder = Path(output_base_folder) / output_folder_name
     output_folder.mkdir(parents=True, exist_ok=True)
     output_file = output_folder / f"{input_stem}-{timestamp}.csv"
     return output_folder, output_file
 
 
-def prepare_csv_reader_writer(input_path: Path, output_file: Path):
-    """
-    Reads the entire input CSV file, prepares the output CSV file with additional headers,
-    and returns the list of input rows and the CSV writer object.
-    """
-    # Read all input data
+def ensure_promise_page():
+
+    with sync_playwright() as p:
+
+        browser = p.chromium.connect_over_cdp(CDP_URL)
+
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+
+        page = get_or_create_promise_page(context)
+
+        page.bring_to_front()
+
+        return True
+
+
+def prepare_csv_reader_writer(
+    input_path: Path, output_file: Path, progress_file: Path = None
+):
+
+    # ----------------------------------------
+    # READ INPUT CSV
+    # ----------------------------------------
+
     with open(input_path, newline="", encoding="utf-8") as f:
+
         input_rows = list(csv.DictReader(f))
+
         input_headers = list(input_rows[0].keys()) if input_rows else []
 
-    # Prepare output headers (add columns you need)
+    # ----------------------------------------
+    # OUTPUT HEADERS
+    # ----------------------------------------
+
     output_headers = input_headers + [
         "Insurance Name",
         "Begin Date",
@@ -149,10 +163,32 @@ def prepare_csv_reader_writer(input_path: Path, output_file: Path):
         "Discrepancy",
         "Penalty",
     ]
-    # Open output CSV and prepare writer
+
+    # ----------------------------------------
+    # CREATE OUTPUT FILE
+    # ----------------------------------------
+
     f_out = open(output_file, mode="w", newline="", encoding="utf-8")
+
     writer = csv.DictWriter(f_out, fieldnames=output_headers)
+
     writer.writeheader()
+
+    # ----------------------------------------
+    # COPY EXISTING PROGRESS
+    # ----------------------------------------
+
+    if progress_file and progress_file.exists():
+
+        with open(progress_file, newline="", encoding="utf-8") as pf:
+
+            progress_reader = csv.DictReader(pf)
+
+            for row in progress_reader:
+
+                writer.writerow(row)
+
+        f_out.flush()
 
     return input_rows, writer, f_out
 
@@ -322,137 +358,330 @@ def take_screenshot(page, output_folder, filename_prefix):
 
 def setup_progress_tracking(input_path, output_headers):
 
+    # ----------------------------------------
+    # PROGRESS FILE PATH
+    # ----------------------------------------
+
     progress_file = input_path.parent / f"{input_path.stem}_progress.csv"
+
+    # ----------------------------------------
+    # TRACK COMPLETED MEMBERS
+    # ----------------------------------------
 
     processed_ids = set()
 
+    # ----------------------------------------
+    # CHECK IF FILE EXISTS
+    # ----------------------------------------
+
     file_exists = progress_file.exists()
+
+    # ----------------------------------------
+    # OPEN PROGRESS FILE
+    # ----------------------------------------
 
     progress_f = open(progress_file, mode="a", newline="", encoding="utf-8")
 
     progress_writer = csv.DictWriter(progress_f, fieldnames=output_headers)
 
+    # ----------------------------------------
+    # WRITE HEADER IF NEW FILE
+    # ----------------------------------------
+
     if not file_exists:
+
         progress_writer.writeheader()
 
+    # ----------------------------------------
+    # LOAD EXISTING PROCESSED IDS
+    # ----------------------------------------
+
     else:
+
         with open(progress_file, newline="", encoding="utf-8") as f:
 
             reader = csv.DictReader(f)
 
             for row in reader:
 
-                medicaid = row.get("Medicaid Number", "").strip()
+                member_id = row.get("Medicaid Number", "").strip()
 
-                if medicaid:
-                    processed_ids.add(medicaid)
+                if member_id:
 
-    return (progress_file, processed_ids, progress_writer, progress_f)
+                    processed_ids.add(member_id)
+
+    # ----------------------------------------
+    # RETURN EVERYTHING
+    # ----------------------------------------
+
+    return (
+        progress_file,
+        processed_ids,
+        progress_writer,
+        progress_f,
+    )
 
 
-def main():
-    ensure_edge_cdp()
+def run_automation(
+    csv_path,
+    output_base_folder,
+    log_callback=None,
+    progress_callback=None,
+    stop_check=None,
+):
+
     with sync_playwright() as p:
+
         browser = p.chromium.connect_over_cdp(CDP_URL)
+
         context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = get_or_create_page(context)
-        input(
-            "Please log in to the portal if needed, then press Enter here to continue..."
-        )
 
-        input_path = get_valid_csv_path()
-        if input_path is None:
-            return  # or exit
+        page = get_or_create_promise_page(context)
 
-        # Prepare output folder and unique output file
+        input_path = Path(csv_path)
+
+        # ----------------------------------------
+        # OUTPUT SETUP
+        # ----------------------------------------
+
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        output_folder, output_file = prepare_output_folder(input_path, timestamp)
 
-        input_rows, writer, f_out = prepare_csv_reader_writer(input_path, output_file)
-
-        progress_file, processed_ids, progress_writer, progress_f = (
-            setup_progress_tracking(input_path, writer.fieldnames)
+        output_folder, output_file = prepare_output_folder(
+            input_path, timestamp, output_base_folder
         )
 
-        # remember to close the file object at the end:
-        # f_out.close()
+        with open(input_path, newline="", encoding="utf-8") as f:
 
-        page.wait_for_selector(
-            "#dnn_PrimaryMenu_PrimaryMenuRepeater_PrimaryItemHCPHyperlink_2"
+            input_headers = list(csv.DictReader(f).fieldnames)
+        (
+            progress_file,
+            processed_ids,
+            progress_writer,
+            progress_f,
+        ) = setup_progress_tracking(
+            input_path,
+            input_headers
+            + [
+                "Insurance Name",
+                "Begin Date",
+                "End Date",
+                "Discrepancy",
+                "Penalty",
+            ],
         )
-        page.click("#dnn_PrimaryMenu_PrimaryMenuRepeater_PrimaryItemHCPHyperlink_2")
+
+        input_rows, writer, f_out = prepare_csv_reader_writer(
+            input_path, output_file, progress_file
+        )
+
+        # ----------------------------------------
+        # NAVIGATE TO ELIGIBILITY PAGE
+        # ----------------------------------------
+
+        try:
+
+            page.wait_for_selector(
+                "#dnn_PrimaryMenu_" "PrimaryMenuRepeater_" "PrimaryItemHCPHyperlink_2",
+                timeout=60000,
+            )
+
+            page.click(
+                "#dnn_PrimaryMenu_" "PrimaryMenuRepeater_" "PrimaryItemHCPHyperlink_2"
+            )
+
+        except Exception as e:
+
+            if log_callback:
+
+                log_callback("❌ Error navigating to " f"Eligibility Search page: {e}")
+
+        # ----------------------------------------
+        # MAIN LOOP
+        # ----------------------------------------
 
         for idx, row in enumerate(input_rows, 1):
-            row_contract = row.get("Contract Name", "").strip()
-            member_id_raw = row.get("Medicaid Number", "").strip()
 
-            if member_id_raw in processed_ids:
+            member_id_raw = "UNKNOWN"
 
-                print(f"⏩ Skipping completed row: {member_id_raw}")
+            try:
+
+                # --------------------------------
+                # STOP CHECK
+                # --------------------------------
+
+                if stop_check and stop_check():
+
+                    if log_callback:
+
+                        log_callback("Automation stopped by user")
+
+                    break
+
+                # --------------------------------
+                # READ CSV DATA
+                # --------------------------------
+
+                row_contract = row.get("Contract Name", "").strip()
+
+                member_id_raw = row.get("Medicaid Number", "").strip()
+
+                # --------------------------------
+                # SKIP COMPLETED ROWS
+                # --------------------------------
+
+                if member_id_raw in processed_ids:
+
+                    if progress_callback:
+
+                        progress_callback(
+                            current=idx, total=len(input_rows), member_id=member_id_raw
+                        )
+
+                    if log_callback:
+
+                        log_callback("⏩ Skipping completed row: " f"{fullname} ({member_id_raw})")
+
+                    continue
+
+                dob = row.get("Date of Birth", "").strip()
+
+                lname = row.get("Last Name", "").strip()
+
+                fname = row.get("First Name", "").strip()
+
+                fullname = f"{lname}, {fname}"
+
+                sanitized_name = sanitize_filename(fullname)
+
+                # --------------------------------
+                # SEARCH
+                # --------------------------------
+
+                start_date_str, end_date_str = search(page, member_id_raw, dob)
+
+                # --------------------------------
+                # EXTRACT RESULTS
+                # --------------------------------
+
+                (
+                    result,
+                    discrepancy,
+                    penalty,
+                ) = extract_results(page, row_contract, start_date_str, end_date_str)
+
+                # --------------------------------
+                # FORMAT RESULTS
+                # --------------------------------
+
+                if not result:
+
+                    agg_name = "N/A"
+
+                    agg_begin = "N/A"
+
+                    agg_end = "N/A"
+
+                else:
+
+                    agg_name = "\n".join(
+                        f"{i+1}. " f"{d['Insurance Name']}"
+                        for i, d in enumerate(result)
+                    )
+
+                    agg_begin = "\n".join(
+                        f"{i+1}. " f"{d['Begin Date']}" for i, d in enumerate(result)
+                    )
+
+                    agg_end = "\n".join(
+                        f"{i+1}. " f"{d['End Date']}" for i, d in enumerate(result)
+                    )
+
+                    # ----------------------------
+                    # SCREENSHOT
+                    # ----------------------------
+
+                    screenshot_prefix = (
+                        f"screenshot_"
+                        f"{sanitized_name}_"
+                        f"{member_id_raw}_"
+                        f"{timestamp}"
+                    )
+
+                    take_screenshot(page, output_folder, screenshot_prefix)
+
+                # --------------------------------
+                # WRITE OUTPUT
+                # --------------------------------
+
+                output_row = dict(row)
+
+                output_row.update(
+                    {
+                        "Insurance Name": agg_name,
+                        "Begin Date": agg_begin,
+                        "End Date": agg_end,
+                        "Discrepancy": discrepancy,
+                        "Penalty": penalty,
+                    }
+                )
+
+                writer.writerow(output_row)
+
+                progress_writer.writerow(output_row)
+
+                # --------------------------------
+                # SAVE IMMEDIATELY
+                # --------------------------------
+
+                f_out.flush()
+
+                progress_f.flush()
+
+                # --------------------------------
+                # LOGGING
+                # --------------------------------
+
+                if log_callback:
+
+                    log_callback(
+                        f"Processed "
+                        f"{idx}/{len(input_rows)}: "
+                        f"{fullname} "
+                        f"({member_id_raw})"
+                    )
+
+                # --------------------------------
+                # PROGRESS UPDATE
+                # --------------------------------
+
+                if progress_callback:
+
+                    progress_callback(
+                        current=idx, total=len(input_rows), member_id=member_id_raw
+                    )
+
+            except Exception as e:
+
+                if log_callback:
+
+                    log_callback(
+                        f"❌ Failed row " f"{idx} " f"({fullname} {member_id_raw}): {e}"
+                    )
 
                 continue
 
-            dob = row.get("Date of Birth", "").strip()
-            lname = row.get("Last Name", "").strip()
-            fname = row.get("First Name", "").strip()
-            fullname = f"{lname}, {fname}"
-            sanitized_name = sanitize_filename(fullname)
+        # ----------------------------------------
+        # CLEANUP
+        # ----------------------------------------
 
-            # Calling the search function to perform the search and get the date range used for discrepancy checking
-            start_date_str, end_date_str = search(page, member_id_raw, dob)
+        f_out.close()
 
-            # Calling the extract_results function to get the results, discrepancy status, and penalty status
-            result, discrepancy, penalty = extract_results(
-                page, row_contract, start_date_str, end_date_str
-            )
-
-            # After extracting `result`, determining `discrepancy`, `penalty`, and within your CSV writing loop:
-
-            if not result:
-                agg_name = "N/A"
-                agg_begin = "N/A"
-                agg_end = "N/A"
-            else:
-                agg_name = "\n".join(
-                    f"{i+1}. {d['Insurance Name']}" for i, d in enumerate(result)
-                )
-                agg_begin = "\n".join(
-                    f"{i+1}. {d['Begin Date']}" for i, d in enumerate(result)
-                )
-                agg_end = "\n".join(
-                    f"{i+1}. {d['End Date']}" for i, d in enumerate(result)
-                )
-
-                screenshot_prefix = (
-                    f"screenshot_{sanitized_name}_{member_id_raw}_{timestamp}"
-                )
-                take_screenshot(page, output_folder, screenshot_prefix)
-
-            output_row = dict(row)
-            output_row.update(
-                {
-                    "Insurance Name": agg_name,
-                    "Begin Date": agg_begin,
-                    "End Date": agg_end,
-                    "Discrepancy": discrepancy,
-                    "Penalty": penalty,
-                }
-            )
-            writer.writerow(output_row)
-            progress_writer.writerow(output_row)
-            progress_f.flush()
-
-            screenshot_prefix = (
-                f"screenshot_{sanitized_name}_{member_id_raw}_{timestamp}"
-            )
-
-            print(f"Processed {idx}/{len(input_rows)}: Medicaid Number={member_id_raw}")
-            f_out.flush()  # ensure data is written to disk after each row
-        f_out.close()  # close the file after processing all rows
         progress_f.close()
 
-    print(f"✅ Automation complete. Output saved to {output_file}")
+    # --------------------------------------------
+    # FINISHED
+    # --------------------------------------------
 
+    if log_callback:
 
-if __name__ == "__main__":
-    main()
+        log_callback("✅ Automation complete. " f"Output saved to {output_file}")
